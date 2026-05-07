@@ -39,40 +39,48 @@ impl<T, const N: usize> RingBuffer<T, N> {
     }
 
     pub fn read(&self) -> Result<T, ()> {
-        if self.is_empty() {
-            return Err(());
+        let rr: T;
+        loop {
+            if self.is_empty() {
+                return Err(());
+            }
+            let idx = self.read_idx.load(Ordering::Acquire);
+            let r = self.buffer[idx].get();
+            if let Err(_) = self.read_idx.compare_exchange_weak(
+                idx,
+                (idx + 1) % self.capacity,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                continue;
+            };
+            self.size.fetch_sub(1, Ordering::SeqCst);
+            rr = unsafe { r.read().assume_init() };
+            break;
         }
-        let idx = self.read_idx.load(Ordering::Acquire);
-        let r = self.buffer[idx].get();
-        if let Err(_) = self.read_idx.compare_exchange(
-            idx,
-            (idx + 1) % self.capacity,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            return self.read();
-        };
-        self.size.fetch_sub(1, Ordering::AcqRel);
-
-        unsafe { Ok(r.read().assume_init()) }
+        Ok(rr)
     }
 
     pub fn write(&self, v: T) -> Result<(), ()> {
-        if self.is_full() {
-            return Err(());
+        loop {
+            if self.is_full() {
+                return Err(());
+            }
+            let idx = self.write_idx.load(Ordering::Acquire);
+            if let Err(_) = self.write_idx.compare_exchange_weak(
+                idx,
+                (idx + 1) % self.capacity,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                // Note: maybe need to add jitter/backoff here
+                continue;
+            };
+            // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
+            unsafe { self.buffer[idx].get().write(MaybeUninit::new(v)) };
+            self.size.fetch_add(1, Ordering::SeqCst);
+            break;
         }
-        let idx = self.write_idx.load(Ordering::Acquire);
-        if let Err(_) = self.write_idx.compare_exchange(
-            idx,
-            (idx + 1) % self.capacity,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            return self.write(v);
-        };
-        // maybe need to do a drop(old_ptr), need to verify memory doesn't leak
-        unsafe { self.buffer[idx].get().write(MaybeUninit::new(v)) };
-        self.size.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -103,8 +111,7 @@ mod tests {
     fn test_multi_threaded_independent_read_and_write() {
         const SIZE: usize = 1024 * 16;
         let logical_cores: usize = thread::available_parallelism().unwrap().into();
-        // needs to be even for test assumptions to work
-        //let iteration_size = logical_cores * 2;
+        // needs to be EVEN for test assumptions to work
         let iteration_size = if logical_cores % 2 == 0 {
             logical_cores
         } else {
@@ -123,22 +130,26 @@ mod tests {
             let t = if i % 2 == 0 {
                 let se = sum_err.clone();
                 thread::spawn(move || {
+                    println!("write enter");
                     for _ in 0..SIZE {
                         // complete regardless of contention
                         if let Err(_) = rbc.write(1) {
                             se.fetch_add(1, Ordering::SeqCst);
                         }
                     }
+                    println!("write exit");
                 })
             } else {
                 thread::spawn(move || {
                     // always empty the ring buffer but it might be better to
                     // move this to the main thread
+                    println!("read enter");
                     while !rbc.is_empty() {
                         if let Ok(r) = rbc.read() {
                             s.fetch_add(r, Ordering::SeqCst);
                         }
                     }
+                    println!("read exit");
                 })
             };
             threads.push(t);
@@ -148,6 +159,6 @@ mod tests {
         }
         let result = (SIZE * iteration_size / 2) - sum_err.load(Ordering::Acquire);
         println!("result is {result}");
-        assert_eq!(sum.load(Ordering::Acquire), result);
+        assert_eq!(sum.load(Ordering::SeqCst), result);
     }
 }
