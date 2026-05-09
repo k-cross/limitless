@@ -3,13 +3,11 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Implementation of a lock-free ring buffer that takes a fixed and unchangable
-/// size of items to store. Items must implement the Default trait in order to
-/// be used.
+/// size of items to store.
 #[derive(Debug)]
 pub struct RingBuffer<T, const N: usize> {
     buffer: Box<[UnsafeCell<MaybeUninit<T>>; N]>,
     capacity: usize,
-    size: AtomicUsize,
     read_idx: AtomicUsize,
     write_idx: AtomicUsize,
 }
@@ -24,18 +22,18 @@ impl<T, const N: usize> RingBuffer<T, N> {
                 UnsafeCell::new(MaybeUninit::<T>::uninit())
             })),
             capacity: N,
-            size: AtomicUsize::new(0),
             read_idx: AtomicUsize::new(0),
             write_idx: AtomicUsize::new(0),
         }
     }
 
     pub fn is_full(&self) -> bool {
-        self.size.load(Ordering::Acquire) == self.capacity
+        (self.write_idx.load(Ordering::Acquire) + 1) % self.capacity
+            == self.read_idx.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.size.load(Ordering::Acquire) == 0
+        self.write_idx.load(Ordering::Acquire) == self.read_idx.load(Ordering::Acquire)
     }
 
     pub fn read(&self) -> Result<T, ()> {
@@ -54,7 +52,6 @@ impl<T, const N: usize> RingBuffer<T, N> {
             ) {
                 continue;
             };
-            self.size.fetch_sub(1, Ordering::SeqCst);
             rr = unsafe { r.read().assume_init() };
             break;
         }
@@ -78,7 +75,6 @@ impl<T, const N: usize> RingBuffer<T, N> {
             };
             // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
             unsafe { self.buffer[idx].get().write(MaybeUninit::new(v)) };
-            self.size.fetch_add(1, Ordering::SeqCst);
             break;
         }
         Ok(())
@@ -94,17 +90,16 @@ mod tests {
     #[test]
     fn test_single_threaded() {
         // Sequential Access
-        let rb: RingBuffer<usize, 5> = RingBuffer::new();
-        for i in 0..5 {
+        const SIZE: usize = 5;
+        let rb: RingBuffer<usize, SIZE> = RingBuffer::new();
+        for i in 0..(SIZE - 1) {
             assert_eq!(Ok(()), rb.write(i));
         }
         assert_eq!(Err(()), rb.write(6));
-        assert_eq!(rb.size.load(Ordering::Acquire), 5);
-        for i in 0..5 {
+        for i in 0..(SIZE - 1) {
             assert_eq!(Ok(i), rb.read());
         }
         assert_eq!(Err(()), rb.read());
-        assert_eq!(rb.size.load(Ordering::Acquire), 0);
     }
 
     #[test]
