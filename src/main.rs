@@ -56,6 +56,12 @@ fn main() {
         for t in threads {
             t.join().unwrap();
         }
+        while !rb.is_empty() {
+            if let Ok(r) = rb.read() {
+                assert_eq!(1, r);
+                sum.fetch_add(r, Ordering::AcqRel);
+            }
+        }
         let result = (SIZE * iteration_size / 2) - sum_err.load(Ordering::Acquire);
         println!("result is {result}");
         assert_eq!(sum.load(Ordering::Acquire), result);

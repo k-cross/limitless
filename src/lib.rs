@@ -1,12 +1,18 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+#[derive(Debug)]
+struct Slot<T> {
+    data: UnsafeCell<MaybeUninit<T>>,
+    initialized: AtomicBool,
+}
 
 /// Implementation of a lock-free ring buffer that takes a fixed and unchangable
 /// size of items to store.
 #[derive(Debug)]
 pub struct RingBuffer<T, const N: usize> {
-    buffer: Box<[UnsafeCell<MaybeUninit<T>>; N]>,
+    buffer: Box<[Slot<T>; N]>,
     capacity: usize,
     read_idx: AtomicUsize,
     write_idx: AtomicUsize,
@@ -18,8 +24,9 @@ unsafe impl<T, const N: usize> Sync for RingBuffer<T, N> {}
 impl<T, const N: usize> RingBuffer<T, N> {
     pub fn new() -> Self {
         Self {
-            buffer: Box::new(std::array::from_fn(|_| {
-                UnsafeCell::new(MaybeUninit::<T>::uninit())
+            buffer: Box::new(std::array::from_fn(|_| Slot {
+                data: UnsafeCell::new(MaybeUninit::uninit()),
+                initialized: AtomicBool::new(false),
             })),
             capacity: N,
             read_idx: AtomicUsize::new(0),
@@ -43,7 +50,10 @@ impl<T, const N: usize> RingBuffer<T, N> {
                 return Err(());
             }
             let idx = self.read_idx.load(Ordering::Acquire);
-            let r = self.buffer[idx].get();
+            if !self.buffer[idx].initialized.load(Ordering::Acquire) {
+                continue;
+            }
+            let r = self.buffer[idx].data.get();
             if let Err(_) = self.read_idx.compare_exchange_weak(
                 idx,
                 (idx + 1) % self.capacity,
@@ -52,7 +62,9 @@ impl<T, const N: usize> RingBuffer<T, N> {
             ) {
                 continue;
             };
+            // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
             rr = unsafe { r.read().assume_init() };
+            self.buffer[idx].initialized.store(false, Ordering::Release);
             break;
         }
         Ok(rr)
@@ -64,6 +76,9 @@ impl<T, const N: usize> RingBuffer<T, N> {
                 return Err(());
             }
             let idx = self.write_idx.load(Ordering::Acquire);
+            if self.buffer[idx].initialized.load(Ordering::Acquire) {
+                continue;
+            }
             if let Err(_) = self.write_idx.compare_exchange_weak(
                 idx,
                 (idx + 1) % self.capacity,
@@ -74,7 +89,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
                 continue;
             };
             // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
-            unsafe { self.buffer[idx].get().write(MaybeUninit::new(v)) };
+            unsafe { self.buffer[idx].data.get().write(MaybeUninit::new(v)) };
+            self.buffer[idx].initialized.store(true, Ordering::Release);
             break;
         }
         Ok(())
