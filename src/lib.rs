@@ -46,24 +46,28 @@ impl<T, const N: usize> RingBuffer<T, N> {
     pub fn read(&self) -> Result<T, ()> {
         let rr: T;
         loop {
+            let idx = self.read_idx.load(Ordering::Acquire);
             if self.is_empty() {
                 return Err(());
             }
-            let idx = self.read_idx.load(Ordering::Acquire);
             if !self.buffer[idx].initialized.load(Ordering::Acquire) {
+                // spin until initialized
                 continue;
             }
-            let r = self.buffer[idx].data.get();
-            if let Err(_) = self.read_idx.compare_exchange_weak(
-                idx,
-                (idx + 1) % self.capacity,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            if self
+                .read_idx
+                .compare_exchange_weak(
+                    idx,
+                    (idx + 1) % self.capacity,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
                 continue;
             };
             // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
-            rr = unsafe { r.read().assume_init() };
+            rr = unsafe { self.buffer[idx].data.get().read().assume_init() };
             self.buffer[idx].initialized.store(false, Ordering::Release);
             break;
         }
@@ -72,22 +76,29 @@ impl<T, const N: usize> RingBuffer<T, N> {
 
     pub fn write(&self, v: T) -> Result<(), ()> {
         loop {
+            let idx = self.write_idx.load(Ordering::Acquire);
+            if self.buffer[idx].initialized.load(Ordering::Acquire) {
+                // spin until uninitialized
+                continue;
+            }
             if self.is_full() {
                 return Err(());
             }
-            let idx = self.write_idx.load(Ordering::Acquire);
-            if self.buffer[idx].initialized.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Err(_) = self.write_idx.compare_exchange_weak(
-                idx,
-                (idx + 1) % self.capacity,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            if self
+                .write_idx
+                .compare_exchange_weak(
+                    idx,
+                    (idx + 1) % self.capacity,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
                 // Note: maybe need to add jitter/backoff here
                 continue;
             };
+            // SAFETY:
+            // - index is guaranteed to be unique given the time checked.
             // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
             unsafe { self.buffer[idx].data.get().write(MaybeUninit::new(v)) };
             self.buffer[idx].initialized.store(true, Ordering::Release);

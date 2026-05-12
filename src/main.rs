@@ -31,7 +31,7 @@ fn main() {
                     println!("write enter");
                     for _ in 0..SIZE {
                         // complete regardless of contention
-                        if let Err(_) = rbc.write(1) {
+                        if let Err(_) = rbc.write(2) {
                             se.fetch_add(1, Ordering::AcqRel);
                         }
                     }
@@ -44,7 +44,7 @@ fn main() {
                     println!("read enter");
                     while !rbc.is_empty() {
                         if let Ok(r) = rbc.read() {
-                            assert_eq!(1, r);
+                            assert_eq!(2, r);
                             s.fetch_add(r, Ordering::AcqRel);
                         }
                     }
@@ -58,11 +58,11 @@ fn main() {
         }
         while !rb.is_empty() {
             if let Ok(r) = rb.read() {
-                assert_eq!(1, r);
+                assert_eq!(2, r);
                 sum.fetch_add(r, Ordering::AcqRel);
             }
         }
-        let result = (SIZE * iteration_size / 2) - sum_err.load(Ordering::Acquire);
+        let result = (2 * SIZE * iteration_size / 2) - (2 * sum_err.load(Ordering::Acquire));
         println!("result is {result}");
         assert_eq!(sum.load(Ordering::Acquire), result);
         loop_counter += 1;
