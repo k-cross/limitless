@@ -1,6 +1,12 @@
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(loom))]
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+#[cfg(not(loom))]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug)]
 struct Slot<T> {
@@ -57,6 +63,7 @@ impl<T> RingBuffer<T> {
                 // spin until initialized
                 continue;
             }
+            // a pause here could cause uninitialized memory reads on a full loop
             if self
                 .read_idx
                 .compare_exchange_weak(
@@ -69,8 +76,14 @@ impl<T> RingBuffer<T> {
             {
                 continue;
             };
-            // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
-            rr = unsafe { self.buffer[idx].data.get().read().assume_init() };
+            // Safety: there is a unique index so only a single thread has access here
+            cfg_if::cfg_if! {
+                if #[cfg(loom)] {
+                    rr = unsafe {self.buffer[idx].data.with(|ptr| core::ptr::read(ptr).assume_init())};
+                } else {
+                    rr = unsafe { core::ptr::read(self.buffer[idx].data.get()).assume_init() };
+                }
+            };
             self.buffer[idx].initialized.store(false, Ordering::Release);
             break;
         }
@@ -103,7 +116,13 @@ impl<T> RingBuffer<T> {
             // SAFETY:
             // - index is guaranteed to be unique given the time checked.
             // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
-            unsafe { self.buffer[idx].data.get().write(MaybeUninit::new(v)) };
+            cfg_if::cfg_if! {
+                if #[cfg(loom)] {
+                    unsafe { self.buffer[idx].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
+                } else {
+                    unsafe { core::ptr::write(self.buffer[idx].data.get(), MaybeUninit::new(v)) }
+                }
+            };
             self.buffer[idx].initialized.store(true, Ordering::Release);
             break;
         }
@@ -114,8 +133,14 @@ impl<T> RingBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(loom)]
+    use loom::sync::Arc;
+    #[cfg(loom)]
+    use loom::thread;
     use std::collections::HashMap;
+    #[cfg(not(loom))]
     use std::sync::Arc;
+    #[cfg(not(loom))]
     use std::thread;
 
     enum WishyWashy {
@@ -146,6 +171,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(loom))]
     fn test_multi_threaded_independent_read_and_write() {
         const SIZE: usize = 1024 * 16;
         let logical_cores: usize = thread::available_parallelism().unwrap().into();
@@ -201,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(loom))]
     fn test_multi_threaded_independent_data_corruption_check() {
         const SIZE: usize = 1024 * 16;
         let logical_cores: usize = thread::available_parallelism().unwrap().into();
@@ -269,5 +296,74 @@ mod tests {
         let r = result.load(Ordering::Acquire);
         println!("result is {r}");
         assert_eq!(sum.load(Ordering::SeqCst), r);
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn test_multi_threaded_loom() {
+        loom::model(|| {
+            const SIZE: usize = 4;
+            // needs to be EVEN for test assumptions to work
+            let iteration_size = 2;
+            println!("running {iteration_size} threads");
+            let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
+            let result = Arc::new(AtomicUsize::new(0));
+            let sum = Arc::new(AtomicUsize::new(0));
+            let sum_err = Arc::new(AtomicUsize::new(0));
+            let mut threads = vec![];
+
+            // read threads === write threads
+            for i in 0..iteration_size {
+                let rbc = rb.clone();
+                let s = sum.clone();
+                let t = if i % 2 == 0 {
+                    let r = result.clone();
+                    let se = sum_err.clone();
+                    thread::spawn(move || {
+                        println!("write enter");
+                        for i in 0..SIZE {
+                            // complete regardless of contention
+                            let mut hm = HashMap::new();
+                            r.fetch_add(i, Ordering::AcqRel);
+                            hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
+                            let w = match i {
+                                n if n % 2 == 0 => WishyWashy::Yes,
+                                n if n % 3 == 0 => WishyWashy::No,
+                                _ => WishyWashy::Maybe,
+                            };
+                            if rbc.write(DataCorruptor { val1: hm, val2: w }).is_err() {
+                                se.fetch_add(1, Ordering::SeqCst);
+                                r.fetch_sub(i, Ordering::AcqRel);
+                            }
+                        }
+                        println!("write exit");
+                    })
+                } else {
+                    thread::spawn(move || {
+                        // always empty the ring buffer but it might be better to
+                        // move this to the main thread
+                        println!("read enter");
+                        while !rbc.is_empty() {
+                            if let Ok(r) = rbc.read() {
+                                s.fetch_add(r.val1["hello"][0], Ordering::SeqCst);
+                            }
+                        }
+                        println!("read exit");
+                    })
+                };
+                threads.push(t);
+            }
+            for t in threads {
+                t.join().unwrap();
+            }
+            while !rb.is_empty() {
+                if let Ok(r) = rb.read() {
+                    sum.fetch_add(r.val1["hello"][0], Ordering::AcqRel);
+                }
+            }
+            let r = result.load(Ordering::Acquire);
+            println!("result is {r}");
+            assert_eq!(sum.load(Ordering::SeqCst), r);
+        });
     }
 }
