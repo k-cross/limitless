@@ -7,7 +7,7 @@ fn main() {
     const SIZE: usize = 1024 * 16;
     let logical_cores: usize = thread::available_parallelism().unwrap().into();
     // needs to be EVEN for test assumptions to work
-    let iteration_size = if logical_cores % 2 == 0 {
+    let iteration_size = if logical_cores.is_multiple_of(2) {
         logical_cores
     } else {
         logical_cores + 1
@@ -16,7 +16,7 @@ fn main() {
     loop {
         println!("loop {loop_counter}");
         println!("running {iteration_size} threads");
-        let rb: Arc<RingBuffer<usize, SIZE>> = Arc::new(RingBuffer::new());
+        let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
         let sum = Arc::new(AtomicUsize::new(0));
         let sum_err = Arc::new(AtomicUsize::new(0));
         let mut threads = vec![];
@@ -31,7 +31,7 @@ fn main() {
                     println!("write enter");
                     for _ in 0..SIZE {
                         // complete regardless of contention
-                        if let Err(_) = rbc.write(2) {
+                        if rbc.write(2).is_err() {
                             se.fetch_add(1, Ordering::AcqRel);
                         }
                     }
