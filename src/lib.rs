@@ -1,12 +1,16 @@
-#[cfg(not(loom))]
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 #[cfg(not(loom))]
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use {
+    core::cell::UnsafeCell,
+    core::hint::spin_loop,
+    core::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 #[cfg(loom)]
-use loom::cell::UnsafeCell;
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use {
+    loom::cell::UnsafeCell,
+    loom::hint::spin_loop,
+    loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 #[derive(Debug)]
 struct Slot<T> {
@@ -61,6 +65,7 @@ impl<T> RingBuffer<T> {
             }
             if !self.buffer[idx].initialized.load(Ordering::Acquire) {
                 // spin until initialized
+                spin_loop();
                 continue;
             }
             // a pause here could cause uninitialized memory reads on a full loop
@@ -74,9 +79,11 @@ impl<T> RingBuffer<T> {
                 )
                 .is_err()
             {
+                spin_loop();
                 continue;
             };
-            // Safety: there is a unique index so only a single thread has access here
+            // SAFETY:
+            // - index is unique given the time checked
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     rr = unsafe {self.buffer[idx].data.with(|ptr| core::ptr::read(ptr).assume_init())};
@@ -95,6 +102,7 @@ impl<T> RingBuffer<T> {
             let idx = self.write_idx.load(Ordering::Acquire);
             if self.buffer[idx].initialized.load(Ordering::Acquire) {
                 // spin until uninitialized
+                spin_loop();
                 continue;
             }
             if self.is_full() {
@@ -111,11 +119,11 @@ impl<T> RingBuffer<T> {
                 .is_err()
             {
                 // Note: maybe need to add jitter/backoff here
+                spin_loop();
                 continue;
             };
             // SAFETY:
-            // - index is guaranteed to be unique given the time checked.
-            // Note: maybe need to do a drop(old_ptr), need to verify memory doesn't leak
+            // - index is unique given the time checked
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     unsafe { self.buffer[idx].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
@@ -133,15 +141,11 @@ impl<T> RingBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(loom)]
-    use loom::sync::Arc;
-    #[cfg(loom)]
-    use loom::thread;
     use std::collections::HashMap;
+    #[cfg(loom)]
+    use {loom::sync::Arc, loom::thread};
     #[cfg(not(loom))]
-    use std::sync::Arc;
-    #[cfg(not(loom))]
-    use std::thread;
+    use {std::sync::Arc, std::thread};
 
     #[allow(dead_code)]
     enum WishyWashy {
@@ -221,6 +225,11 @@ mod tests {
         }
         for t in threads {
             t.join().unwrap();
+        }
+        while !rb.is_empty() {
+            if let Ok(r) = rb.read() {
+                sum.fetch_add(r, Ordering::SeqCst);
+            }
         }
         let result = (SIZE * iteration_size / 2) - sum_err.load(Ordering::Acquire);
         println!("result is {result}");
@@ -312,7 +321,7 @@ mod tests {
 
             let t1 = thread::spawn(move || {
                 let mut hs: HashSet<usize> = HashSet::new();
-                while !rbd.is_empty() {
+                for _ in 0..SIZE {
                     if let Ok(r) = rbd.read() {
                         hs.insert(r);
                     }
@@ -322,7 +331,7 @@ mod tests {
 
             let t2 = thread::spawn(move || {
                 let mut hs: HashSet<usize> = HashSet::new();
-                while !rbe.is_empty() {
+                for _ in 0..SIZE {
                     if let Ok(r) = rbe.read() {
                         hs.insert(r);
                     }
@@ -330,8 +339,7 @@ mod tests {
                 hs
             });
 
-            for i in 0..(SIZE + 1) {
-                // complete regardless of contention
+            for i in 0..(SIZE) {
                 let _ = rb.write(i);
             }
 
