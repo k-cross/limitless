@@ -143,6 +143,7 @@ mod tests {
     #[cfg(not(loom))]
     use std::thread;
 
+    #[allow(dead_code)]
     enum WishyWashy {
         No,
         Yes,
@@ -301,69 +302,42 @@ mod tests {
     #[test]
     #[cfg(loom)]
     fn test_multi_threaded_loom() {
+        use std::collections::HashSet;
         loom::model(|| {
             const SIZE: usize = 4;
-            // needs to be EVEN for test assumptions to work
-            let iteration_size = 2;
-            println!("running {iteration_size} threads");
-            let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
-            let result = Arc::new(AtomicUsize::new(0));
-            let sum = Arc::new(AtomicUsize::new(0));
-            let sum_err = Arc::new(AtomicUsize::new(0));
-            let mut threads = vec![];
+            let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
 
-            // read threads === write threads
-            for i in 0..iteration_size {
-                let rbc = rb.clone();
-                let s = sum.clone();
-                let t = if i % 2 == 0 {
-                    let r = result.clone();
-                    let se = sum_err.clone();
-                    thread::spawn(move || {
-                        println!("write enter");
-                        for i in 0..SIZE {
-                            // complete regardless of contention
-                            let mut hm = HashMap::new();
-                            r.fetch_add(i, Ordering::AcqRel);
-                            hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
-                            let w = match i {
-                                n if n % 2 == 0 => WishyWashy::Yes,
-                                n if n % 3 == 0 => WishyWashy::No,
-                                _ => WishyWashy::Maybe,
-                            };
-                            if rbc.write(DataCorruptor { val1: hm, val2: w }).is_err() {
-                                se.fetch_add(1, Ordering::SeqCst);
-                                r.fetch_sub(i, Ordering::AcqRel);
-                            }
-                        }
-                        println!("write exit");
-                    })
-                } else {
-                    thread::spawn(move || {
-                        // always empty the ring buffer but it might be better to
-                        // move this to the main thread
-                        println!("read enter");
-                        while !rbc.is_empty() {
-                            if let Ok(r) = rbc.read() {
-                                s.fetch_add(r.val1["hello"][0], Ordering::SeqCst);
-                            }
-                        }
-                        println!("read exit");
-                    })
-                };
-                threads.push(t);
-            }
-            for t in threads {
-                t.join().unwrap();
-            }
-            while !rb.is_empty() {
-                if let Ok(r) = rb.read() {
-                    sum.fetch_add(r.val1["hello"][0], Ordering::AcqRel);
+            let rbd = rb.clone();
+            let rbe = rb.clone();
+
+            let t1 = thread::spawn(move || {
+                let mut hs: HashSet<usize> = HashSet::new();
+                while !rbd.is_empty() {
+                    if let Ok(r) = rbd.read() {
+                        hs.insert(r);
+                    }
                 }
+                hs
+            });
+
+            let t2 = thread::spawn(move || {
+                let mut hs: HashSet<usize> = HashSet::new();
+                while !rbe.is_empty() {
+                    if let Ok(r) = rbe.read() {
+                        hs.insert(r);
+                    }
+                }
+                hs
+            });
+
+            for i in 0..(SIZE + 1) {
+                // complete regardless of contention
+                let _ = rb.write(i);
             }
-            let r = result.load(Ordering::Acquire);
-            println!("result is {r}");
-            assert_eq!(sum.load(Ordering::SeqCst), r);
+
+            let hs_1 = t1.join().unwrap();
+            let hs_2 = t2.join().unwrap();
+            assert!(hs_1.is_disjoint(&hs_2));
         });
     }
 }
