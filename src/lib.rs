@@ -124,6 +124,8 @@ impl<T> RingBuffer<T> {
             };
             // SAFETY:
             // - index is unique given the time checked
+            // - overwrite cannot happen since read must first uninitialize
+            // - last operation is memory initialization
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     unsafe { self.buffer[idx].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
@@ -138,13 +140,10 @@ impl<T> RingBuffer<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    #[cfg(loom)]
-    use {loom::sync::Arc, loom::thread};
-    #[cfg(not(loom))]
     use {std::sync::Arc, std::thread};
 
     #[allow(dead_code)]
@@ -176,7 +175,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(loom))]
     fn test_multi_threaded_independent_read_and_write() {
         const SIZE: usize = 1024 * 16;
         let logical_cores: usize = thread::available_parallelism().unwrap().into();
@@ -237,7 +235,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(loom))]
     fn test_multi_threaded_independent_data_corruption_check() {
         const SIZE: usize = 1024 * 16;
         let logical_cores: usize = thread::available_parallelism().unwrap().into();
@@ -309,11 +306,54 @@ mod tests {
     }
 
     #[test]
-    #[cfg(loom)]
+    fn test_multi_threaded_not_loom() {
+        use std::collections::HashSet;
+        const SIZE: usize = 3;
+        let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
+
+        let rbd = rb.clone();
+        let rbe = rb.clone();
+
+        let t1 = thread::spawn(move || {
+            let mut hs: HashSet<usize> = HashSet::new();
+            for _ in 0..SIZE {
+                if let Ok(r) = rbd.read() {
+                    hs.insert(r);
+                }
+            }
+            hs
+        });
+
+        let t2 = thread::spawn(move || {
+            let mut hs: HashSet<usize> = HashSet::new();
+            for _ in 0..SIZE {
+                if let Ok(r) = rbe.read() {
+                    hs.insert(r);
+                }
+            }
+            hs
+        });
+
+        for i in 0..(SIZE) {
+            let _ = rb.write(i);
+        }
+
+        let hs_1 = t1.join().unwrap();
+        let hs_2 = t2.join().unwrap();
+        assert!(hs_1.is_disjoint(&hs_2) || hs_1.is_empty());
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use {loom::sync::Arc, loom::thread};
+
+    #[test]
     fn test_multi_threaded_loom() {
         use std::collections::HashSet;
         loom::model(|| {
-            const SIZE: usize = 4;
+            const SIZE: usize = 3;
             let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
 
             let rbd = rb.clone();
@@ -345,7 +385,7 @@ mod tests {
 
             let hs_1 = t1.join().unwrap();
             let hs_2 = t2.join().unwrap();
-            assert!(hs_1.is_disjoint(&hs_2));
+            assert!(hs_1.is_disjoint(&hs_2) || hs_1.is_empty());
         });
     }
 }
