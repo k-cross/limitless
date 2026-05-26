@@ -56,11 +56,22 @@ impl<T> RingBuffer<T> {
         self.write_idx.load(Ordering::Acquire) == self.read_idx.load(Ordering::Acquire)
     }
 
+    // private full reducing atomic operations to compared indices
+    fn full(&self, r: usize, w: usize) -> bool {
+        (w + 1) % self.capacity == r
+    }
+
+    // private empty reducing atomic operations to compared indices
+    fn empty(&self, r: usize, w: usize) -> bool {
+        w == r
+    }
+
     pub fn read(&self) -> Result<T, ()> {
         let rr: T;
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
-            if self.is_empty() {
+            let widx = self.write_idx.load(Ordering::Acquire);
+            if self.empty(idx, widx) {
                 return Err(());
             }
             if !self.buffer[idx].initialized.load(Ordering::Acquire) {
@@ -100,12 +111,13 @@ impl<T> RingBuffer<T> {
     pub fn write(&self, v: T) -> Result<(), ()> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
+            let ridx = self.read_idx.load(Ordering::Acquire);
             if self.buffer[idx].initialized.load(Ordering::Acquire) {
                 // spin until uninitialized
                 spin_loop();
                 continue;
             }
-            if self.is_full() {
+            if self.full(ridx, idx) {
                 return Err(());
             }
             if self
