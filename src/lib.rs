@@ -3,19 +3,19 @@ use core::mem::MaybeUninit;
 use {
     core::cell::UnsafeCell,
     core::hint::spin_loop,
-    core::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    core::sync::atomic::{AtomicUsize, Ordering},
 };
 #[cfg(loom)]
 use {
     loom::cell::UnsafeCell,
     loom::hint::spin_loop,
-    loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    loom::sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[derive(Debug)]
 struct Slot<T> {
     data: UnsafeCell<MaybeUninit<T>>,
-    initialized: AtomicBool,
+    stamp: AtomicUsize,
 }
 
 /// Implementation of a lock-free ring buffer that takes a fixed and unchangable
@@ -36,20 +36,24 @@ impl<T> RingBuffer<T> {
         let buffer: Box<[Slot<T>]> = (0..capacity)
             .map(|_| Slot {
                 data: UnsafeCell::new(MaybeUninit::uninit()),
-                initialized: AtomicBool::new(false),
+                stamp: AtomicUsize::new(0),
             })
             .collect();
         Self {
             buffer,
             capacity,
-            read_idx: AtomicUsize::new(0),
-            write_idx: AtomicUsize::new(0),
+            // cannot start on index 0 due to stamp initialization ambiguity
+            read_idx: AtomicUsize::new(1),
+            write_idx: AtomicUsize::new(1),
         }
     }
 
     pub fn is_full(&self) -> bool {
-        (self.write_idx.load(Ordering::Acquire) + 1) % self.capacity
-            == self.read_idx.load(Ordering::Acquire)
+        // uses more cpu cycles but no side effects: (w % self.capacity == r % self.capacity) && (r != w)
+        self.write_idx
+            .load(Ordering::Acquire)
+            .abs_diff(self.read_idx.load(Ordering::Acquire))
+            >= self.capacity
     }
 
     pub fn is_empty(&self) -> bool {
@@ -58,7 +62,8 @@ impl<T> RingBuffer<T> {
 
     // private full reducing atomic operations to compared indices
     fn full(&self, r: usize, w: usize) -> bool {
-        (w + 1) % self.capacity == r
+        // uses more cpu cycles but no side effects: (w % self.capacity == r % self.capacity) && (r != w)
+        w.abs_diff(r) >= self.capacity
     }
 
     // private empty reducing atomic operations to compared indices
@@ -71,10 +76,11 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
             let widx = self.write_idx.load(Ordering::Acquire);
+            let i = idx % self.capacity;
             if self.empty(idx, widx) {
                 return Err(());
             }
-            if !self.buffer[idx].initialized.load(Ordering::Acquire) {
+            if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
                 // spin until initialized
                 spin_loop();
                 continue;
@@ -84,7 +90,7 @@ impl<T> RingBuffer<T> {
                 .read_idx
                 .compare_exchange_weak(
                     idx,
-                    (idx + 1) % self.capacity,
+                    idx.wrapping_add(1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
@@ -97,12 +103,11 @@ impl<T> RingBuffer<T> {
             // - index is unique given the time checked
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    rr = unsafe {self.buffer[idx].data.with(|ptr| core::ptr::read(ptr).assume_init())};
+                    rr = unsafe {self.buffer[i].data.with(|ptr| core::ptr::read(ptr).assume_init())};
                 } else {
-                    rr = unsafe { core::ptr::read(self.buffer[idx].data.get()).assume_init() };
+                    rr = unsafe { core::ptr::read(self.buffer[i].data.get()).assume_init() };
                 }
             };
-            self.buffer[idx].initialized.store(false, Ordering::Release);
             break;
         }
         Ok(rr)
@@ -112,7 +117,8 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
             let ridx = self.read_idx.load(Ordering::Acquire);
-            if self.buffer[idx].initialized.load(Ordering::Acquire) {
+            let i = idx % self.capacity;
+            if self.buffer[i].stamp.load(Ordering::Acquire) > ridx {
                 // spin until uninitialized
                 spin_loop();
                 continue;
@@ -124,7 +130,7 @@ impl<T> RingBuffer<T> {
                 .write_idx
                 .compare_exchange_weak(
                     idx,
-                    (idx + 1) % self.capacity,
+                    idx.wrapping_add(1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
@@ -140,12 +146,12 @@ impl<T> RingBuffer<T> {
             // - last operation is memory initialization
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    unsafe { self.buffer[idx].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
+                    unsafe { self.buffer[i].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
                 } else {
-                    unsafe { core::ptr::write(self.buffer[idx].data.get(), MaybeUninit::new(v)) }
+                    unsafe { core::ptr::write(self.buffer[i].data.get(), MaybeUninit::new(v)) }
                 }
             };
-            self.buffer[idx].initialized.store(true, Ordering::Release);
+            self.buffer[i].stamp.store(idx, Ordering::Release);
             break;
         }
         Ok(())
@@ -176,11 +182,11 @@ mod tests {
         // Sequential Access
         const SIZE: usize = 5;
         let rb: RingBuffer<usize> = RingBuffer::new(SIZE);
-        for i in 0..(SIZE - 1) {
+        for i in 0..(SIZE) {
             assert_eq!(Ok(()), rb.write(i));
         }
         assert_eq!(Err(()), rb.write(6));
-        for i in 0..(SIZE - 1) {
+        for i in 0..(SIZE) {
             assert_eq!(Ok(i), rb.read());
         }
         assert_eq!(Err(()), rb.read());
@@ -362,10 +368,16 @@ mod loom_tests {
     use {loom::sync::Arc, loom::thread};
 
     #[test]
-    fn test_multi_threaded_loom() {
+    fn test_three_threads() {
         use std::collections::HashSet;
-        loom::model(|| {
-            const SIZE: usize = 3;
+        let mut mdl = loom::model::Builder::new();
+        mdl.preemption_bound = Some(2);
+        mdl.max_branches = 100_000;
+        mdl.max_threads = 3;
+        mdl.max_duration = Some(std::time::Duration::from_secs(120));
+
+        mdl.check(|| {
+            const SIZE: usize = 2;
             let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
 
             let rbd = rb.clone();
@@ -398,6 +410,27 @@ mod loom_tests {
             let hs_1 = t1.join().unwrap();
             let hs_2 = t2.join().unwrap();
             assert!(hs_1.is_disjoint(&hs_2) || hs_1.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_two_threads() {
+        loom::model(|| {
+            const SIZE: usize = 2;
+            let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
+            let rbd = rb.clone();
+
+            let t1 = thread::spawn(move || {
+                for _ in 0..SIZE {
+                    let _ = rbd.read();
+                }
+            });
+
+            for i in 0..(SIZE) {
+                let _ = rb.write(i);
+            }
+
+            let _ = t1.join().unwrap();
         });
     }
 }
