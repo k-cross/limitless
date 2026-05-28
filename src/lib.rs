@@ -8,7 +8,7 @@ use {
 #[cfg(loom)]
 use {
     loom::cell::UnsafeCell,
-    loom::hint::spin_loop,
+    loom::lazy_static::yield_now,
     loom::sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -34,22 +34,20 @@ unsafe impl<T> Sync for RingBuffer<T> {}
 impl<T> RingBuffer<T> {
     pub fn new(capacity: usize) -> Self {
         let buffer: Box<[Slot<T>]> = (0..capacity)
-            .map(|_| Slot {
+            .map(|i| Slot {
                 data: UnsafeCell::new(MaybeUninit::uninit()),
-                stamp: AtomicUsize::new(0),
+                stamp: AtomicUsize::new(i + 1),
             })
             .collect();
         Self {
             buffer,
             capacity,
-            // cannot start on index 0 due to stamp initialization ambiguity
-            read_idx: AtomicUsize::new(1),
-            write_idx: AtomicUsize::new(1),
+            read_idx: AtomicUsize::new(0),
+            write_idx: AtomicUsize::new(0),
         }
     }
 
     pub fn is_full(&self) -> bool {
-        // uses more cpu cycles but no side effects: (w % self.capacity == r % self.capacity) && (r != w)
         self.write_idx
             .load(Ordering::Acquire)
             .abs_diff(self.read_idx.load(Ordering::Acquire))
@@ -62,7 +60,6 @@ impl<T> RingBuffer<T> {
 
     // private full reducing atomic operations to compared indices
     fn full(&self, r: usize, w: usize) -> bool {
-        // uses more cpu cycles but no side effects: (w % self.capacity == r % self.capacity) && (r != w)
         w.abs_diff(r) >= self.capacity
     }
 
@@ -82,10 +79,15 @@ impl<T> RingBuffer<T> {
             }
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
                 // spin until initialized
-                spin_loop();
+                cfg_if::cfg_if! {
+                    if #[cfg(loom)] {
+                        yield_now();
+                    } else {
+                        spin_loop();
+                    }
+                };
                 continue;
             }
-            // a pause here could cause uninitialized memory reads on a full loop
             if self
                 .read_idx
                 .compare_exchange_weak(
@@ -96,11 +98,19 @@ impl<T> RingBuffer<T> {
                 )
                 .is_err()
             {
-                spin_loop();
+                cfg_if::cfg_if! {
+                    if #[cfg(loom)] {
+                        yield_now();
+                    } else {
+                        spin_loop();
+                    }
+                };
                 continue;
             };
             // SAFETY:
             // - index is unique given the time checked
+            // - last operation is memory uninitialization, safe for writes
+            // - does not re-enter on a full loop; uninitialization is specific and can't read uninitialized data
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     rr = unsafe {self.buffer.get_unchecked(i).data.with(|ptr| core::ptr::read(ptr).assume_init())};
@@ -108,6 +118,9 @@ impl<T> RingBuffer<T> {
                     rr = unsafe { self.buffer.get_unchecked(i).data.get().read().assume_init() };
                 }
             };
+            self.buffer[i]
+                .stamp
+                .store(idx.wrapping_add(self.capacity + 1), Ordering::Release);
             break;
         }
         Ok(rr)
@@ -118,13 +131,19 @@ impl<T> RingBuffer<T> {
             let idx = self.write_idx.load(Ordering::Acquire);
             let ridx = self.read_idx.load(Ordering::Acquire);
             let i = idx % self.capacity;
-            if self.buffer[i].stamp.load(Ordering::Acquire) > ridx {
-                // spin until uninitialized
-                spin_loop();
-                continue;
-            }
             if self.full(ridx, idx) {
                 return Err(());
+            }
+            if self.buffer[i].stamp.load(Ordering::Acquire) != idx.wrapping_add(1) {
+                // spin until uninitialized
+                cfg_if::cfg_if! {
+                    if #[cfg(loom)] {
+                        yield_now();
+                    } else {
+                        spin_loop();
+                    }
+                };
+                continue;
             }
             if self
                 .write_idx
@@ -137,13 +156,19 @@ impl<T> RingBuffer<T> {
                 .is_err()
             {
                 // Note: maybe need to add jitter/backoff here
-                spin_loop();
+                cfg_if::cfg_if! {
+                    if #[cfg(loom)] {
+                        yield_now();
+                    } else {
+                        spin_loop();
+                    }
+                };
                 continue;
             };
             // SAFETY:
-            // - index is unique given the time checked
-            // - overwrite cannot happen since read must first uninitialize
-            // - last operation is memory initialization
+            // - index is unique given the time checked, safe for writes
+            // - last operation is memory initialization, safe for reads
+            // - does not re-enter on a full loop; initialization is not ambiguous, no overwrite
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     unsafe { self.buffer.get_unchecked(i).data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
@@ -182,14 +207,20 @@ mod tests {
         // Sequential Access
         const SIZE: usize = 5;
         let rb: RingBuffer<usize> = RingBuffer::new(SIZE);
-        for i in 0..(SIZE) {
-            assert_eq!(Ok(()), rb.write(i));
+
+        // cycle twice to catch syncronization issues between empty/full state changes
+        for _ in 0..2 {
+            for i in 0..(SIZE) {
+                assert_eq!(Ok(()), rb.write(i));
+            }
+            // full
+            assert_eq!(Err(()), rb.write(6));
+            for i in 0..(SIZE) {
+                assert_eq!(Ok(i), rb.read());
+            }
+            // empty
+            assert_eq!(Err(()), rb.read());
         }
-        assert_eq!(Err(()), rb.write(6));
-        for i in 0..(SIZE) {
-            assert_eq!(Ok(i), rb.read());
-        }
-        assert_eq!(Err(()), rb.read());
     }
 
     #[test]
