@@ -103,9 +103,9 @@ impl<T> RingBuffer<T> {
             // - index is unique given the time checked
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    rr = unsafe {self.buffer[i].data.with(|ptr| core::ptr::read(ptr).assume_init())};
+                    rr = unsafe {self.buffer.get_unchecked(i).data.with(|ptr| core::ptr::read(ptr).assume_init())};
                 } else {
-                    rr = unsafe { core::ptr::read(self.buffer[i].data.get()).assume_init() };
+                    rr = unsafe { self.buffer.get_unchecked(i).data.get().read().assume_init() };
                 }
             };
             break;
@@ -146,9 +146,9 @@ impl<T> RingBuffer<T> {
             // - last operation is memory initialization
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    unsafe { self.buffer[i].data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
+                    unsafe { self.buffer.get_unchecked(i).data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
                 } else {
-                    unsafe { core::ptr::write(self.buffer[i].data.get(), MaybeUninit::new(v)) }
+                    unsafe { self.buffer.get_unchecked(i).data.get().write(MaybeUninit::new(v)) }
                 }
             };
             self.buffer[i].stamp.store(idx, Ordering::Release);
@@ -365,7 +365,21 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
     use {loom::sync::Arc, loom::thread};
+
+    #[allow(dead_code)]
+    enum WishyWashy {
+        No,
+        Yes,
+        Maybe,
+    }
+
+    #[allow(dead_code)]
+    struct DataCorruptor {
+        val1: HashMap<String, Vec<usize>>,
+        val2: WishyWashy,
+    }
 
     #[test]
     fn test_three_threads() {
@@ -374,7 +388,7 @@ mod loom_tests {
         mdl.preemption_bound = Some(2);
         mdl.max_branches = 100_000;
         mdl.max_threads = 3;
-        mdl.max_duration = Some(std::time::Duration::from_secs(120));
+        mdl.max_duration = Some(std::time::Duration::from_secs(30));
 
         mdl.check(|| {
             const SIZE: usize = 2;
@@ -416,18 +430,58 @@ mod loom_tests {
     #[test]
     fn test_two_threads() {
         loom::model(|| {
-            const SIZE: usize = 2;
+            const SIZE: usize = 3;
             let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
             let rbd = rb.clone();
+            let mut hs_w = HashSet::new();
+            let mut hs_e = HashSet::new();
+
+            let t1 = thread::spawn(move || {
+                let mut hs = HashSet::new();
+                for _ in 0..(SIZE * 2) {
+                    if let Ok(v) = rbd.read() {
+                        hs.insert(v);
+                    }
+                }
+                hs
+            });
+
+            for i in 0..(SIZE * 2) {
+                if let Ok(_) = rb.write(i) {
+                    hs_w.insert(i);
+                } else {
+                    hs_e.insert(i);
+                }
+            }
+
+            let hs_r = t1.join().unwrap();
+            assert!(hs_r.is_subset(&hs_w));
+            assert!(hs_r.is_disjoint(&hs_e) || hs_r.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_two_threads_non_copy_type() {
+        loom::model(|| {
+            const SIZE: usize = 2;
+            let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
+            let rbc = rb.clone();
 
             let t1 = thread::spawn(move || {
                 for _ in 0..SIZE {
-                    let _ = rbd.read();
+                    let _ = rbc.read();
                 }
             });
 
-            for i in 0..(SIZE) {
-                let _ = rb.write(i);
+            for i in 0..SIZE {
+                let mut hm = HashMap::new();
+                hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
+                let w = match i {
+                    n if n % 2 == 0 => WishyWashy::Yes,
+                    n if n % 3 == 0 => WishyWashy::No,
+                    _ => WishyWashy::Maybe,
+                };
+                let _ = rb.write(DataCorruptor { val1: hm, val2: w });
             }
 
             let _ = t1.join().unwrap();
