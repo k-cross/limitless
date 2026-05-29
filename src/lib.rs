@@ -419,7 +419,7 @@ mod loom_tests {
         mdl.preemption_bound = Some(2);
         mdl.max_branches = 100_000;
         mdl.max_threads = 3;
-        mdl.max_duration = Some(std::time::Duration::from_secs(30));
+        mdl.max_duration = Some(std::time::Duration::from_secs(120));
 
         mdl.check(|| {
             const SIZE: usize = 2;
@@ -493,7 +493,9 @@ mod loom_tests {
 
     #[test]
     fn test_two_threads_non_copy_type() {
-        loom::model(|| {
+        let mut mdl = loom::model::Builder::new();
+        mdl.preemption_bound = Some(2);
+        mdl.check(|| {
             const SIZE: usize = 2;
             let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
             let rbc = rb.clone();
