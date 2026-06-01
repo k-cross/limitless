@@ -2,7 +2,7 @@ use core::mem::MaybeUninit;
 #[cfg(not(loom))]
 use {
     core::cell::UnsafeCell,
-    core::hint::spin_loop,
+    core::hint::{cold_path, spin_loop},
     core::sync::atomic::{AtomicUsize, Ordering},
 };
 #[cfg(loom)]
@@ -16,6 +16,12 @@ use {
 struct Slot<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     stamp: AtomicUsize,
+}
+
+#[derive(PartialEq)]
+enum VerficationState {
+    Valid,
+    Unchecked,
 }
 
 /// Implementation of a lock-free ring buffer that takes a fixed and unchangable
@@ -68,36 +74,89 @@ impl<T> RingBuffer<T> {
         w == r
     }
 
+    fn fix_read(&self, id: usize, present_stamp: usize) -> Result<(), ()> {
+        // Verify that the stamp is in a bad state by checking if it's in its
+        // former uninitialized state.
+        if present_stamp == id.wrapping_sub(self.capacity - 1) {
+            cold_path();
+            // reading values should not be done, move the index forward to
+            // unblock readers
+            if self
+                .read_idx
+                .compare_exchange(id, id.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.buffer[id % self.capacity]
+                    .stamp
+                    .store(id.wrapping_add(self.capacity + 1), Ordering::SeqCst);
+                return Err(());
+            }
+        };
+        Ok(())
+    }
+
+    fn fix_write(&self, id: usize, present_stamp: usize) -> Result<(), ()> {
+        // Verify that the stamp is in a bad state by checking if it's in its
+        // former initialized state.
+        if present_stamp == id.wrapping_sub(self.capacity) {
+            cold_path();
+            // it's possible to return the former value since it's implied
+            // it crashed here but we'll skip doing that for now and set it
+            // to be overwritten instead
+            if self.buffer[id % self.capacity]
+                .stamp
+                .compare_exchange(
+                    present_stamp,
+                    id.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Err(());
+            }
+        };
+        Ok(())
+    }
+
     pub fn read(&self) -> Result<T, ()> {
         let rr: T;
+        let mut idx = self.read_idx.load(Ordering::Acquire);
+        let mut valid: VerficationState = VerficationState::Unchecked;
         loop {
-            let idx = self.read_idx.load(Ordering::Acquire);
             let widx = self.write_idx.load(Ordering::Acquire);
             let i = idx % self.capacity;
             if self.empty(idx, widx) {
                 return Err(());
             }
-            if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
+            let stamp = self.buffer[i].stamp.load(Ordering::Acquire);
+            if stamp != idx {
+                // Note: add delay or else spin can be too quick and this will occur
+                if valid == VerficationState::Unchecked {
+                    if self.fix_read(idx, stamp).is_err() {
+                        return Err(());
+                    }
+                    valid = VerficationState::Valid;
+                }
+                // update index is required here with multi-reader setup
+                idx = self.read_idx.load(Ordering::Acquire);
                 // spin until initialized
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
-                        yield_now();
+                        yield_now()
                     } else {
-                        spin_loop();
+                        spin_loop()
                     }
                 };
                 continue;
-            }
-            if self
-                .read_idx
-                .compare_exchange_weak(
-                    idx,
-                    idx.wrapping_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
+            };
+            if let Err(ridx) = self.read_idx.compare_exchange_weak(
+                idx,
+                idx.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                idx = ridx;
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
                         yield_now();
@@ -120,21 +179,31 @@ impl<T> RingBuffer<T> {
             };
             self.buffer[i]
                 .stamp
-                .store(idx.wrapping_add(self.capacity + 1), Ordering::Release);
+                .fetch_add(self.capacity + 1, Ordering::Release);
             break;
         }
         Ok(rr)
     }
 
     pub fn write(&self, v: T) -> Result<(), ()> {
+        let mut idx = self.write_idx.load(Ordering::Acquire);
+        let mut valid: VerficationState = VerficationState::Unchecked;
         loop {
-            let idx = self.write_idx.load(Ordering::Acquire);
             let ridx = self.read_idx.load(Ordering::Acquire);
             let i = idx % self.capacity;
             if self.full(ridx, idx) {
                 return Err(());
             }
-            if self.buffer[i].stamp.load(Ordering::Acquire) != idx.wrapping_add(1) {
+            let stamp = self.buffer[i].stamp.load(Ordering::Acquire);
+            if stamp != idx.wrapping_add(1) {
+                if valid == VerficationState::Unchecked {
+                    if self.fix_write(idx, stamp).is_err() {
+                        return Err(());
+                    }
+                    valid = VerficationState::Valid;
+                };
+                // update required with multiple-writers
+                idx = self.write_idx.load(Ordering::Acquire);
                 // spin until uninitialized
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
@@ -145,16 +214,13 @@ impl<T> RingBuffer<T> {
                 };
                 continue;
             }
-            if self
-                .write_idx
-                .compare_exchange_weak(
-                    idx,
-                    idx.wrapping_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
+            if let Err(widx) = self.write_idx.compare_exchange_weak(
+                idx,
+                idx.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                idx = widx;
                 // Note: maybe need to add jitter/backoff here
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
