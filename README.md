@@ -4,8 +4,8 @@ A project that implements high-performance thread safe data structures.
 
 # Performance Analysis
 
-Given my machines are usually MacOS I did quite a bit of performance analysis using MacOS so unless otherwise stated, that should be the operating assumption.
+Given my machines are usually MacOS I did performance analysis using it unless otherwise stated:
 
-There is a `D` script which measures the CAS pressure using DTrace on MacOS:
-
-- run with `sudo dtrace -s cas.d -c target/release/limitless`
+- L1 Cache Miss Rate: 67%
+- Instructions per Clock: 0.0306
+- Thread Count: 8 (4 read, 4 write)

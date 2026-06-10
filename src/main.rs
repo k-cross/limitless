@@ -1,4 +1,4 @@
-use limitless::*;
+use limitless::RingBuffer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;

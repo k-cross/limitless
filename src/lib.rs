@@ -183,6 +183,15 @@ impl<T> RingBuffer<T> {
     }
 }
 
+// ****************************************
+//           monomorphic wrappers
+// ****************************************
+#[doc(hidden)]
+#[inline(never)]
+pub fn __instantiate_ringbuffer_usize() -> RingBuffer<usize> {
+    RingBuffer::new(20)
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;

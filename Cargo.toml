@@ -2,6 +2,15 @@
 name = "limitless"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ken Cross <ken.q.cross@gmail.com"]
+
+[lib]
+name = "limitless"
+path = "src/lib.rs"
+
+[[bin]]
+name = "limitless"
+path = "src/main.rs"
 
 [dependencies]
 cfg-if = "1.0.4"
