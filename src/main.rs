@@ -13,7 +13,7 @@ fn main() {
         logical_cores + 1
     };
     let mut loop_counter: usize = 0;
-    loop {
+    for _ in 0..200 {
         println!("loop {loop_counter}");
         println!("running {iteration_size} threads");
         let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
