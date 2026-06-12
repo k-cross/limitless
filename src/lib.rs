@@ -1,4 +1,5 @@
 use core::mem::MaybeUninit;
+use crossbeam::utils::CachePadded;
 #[cfg(not(loom))]
 use {
     core::cell::UnsafeCell,
@@ -23,9 +24,9 @@ struct Slot<T> {
 #[derive(Debug)]
 pub struct RingBuffer<T> {
     buffer: Box<[Slot<T>]>,
-    capacity: usize,
-    read_idx: AtomicUsize,
-    write_idx: AtomicUsize,
+    capacity: CachePadded<usize>,
+    read_idx: CachePadded<AtomicUsize>,
+    write_idx: CachePadded<AtomicUsize>,
 }
 
 unsafe impl<T> Send for RingBuffer<T> {}
@@ -41,9 +42,9 @@ impl<T> RingBuffer<T> {
             .collect();
         Self {
             buffer,
-            capacity,
-            read_idx: AtomicUsize::new(0),
-            write_idx: AtomicUsize::new(0),
+            capacity: CachePadded::new(capacity),
+            read_idx: CachePadded::new(AtomicUsize::new(0)),
+            write_idx: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -51,7 +52,7 @@ impl<T> RingBuffer<T> {
         self.write_idx
             .load(Ordering::Acquire)
             .abs_diff(self.read_idx.load(Ordering::Acquire))
-            >= self.capacity
+            >= *self.capacity
     }
 
     pub fn is_empty(&self) -> bool {
@@ -60,7 +61,7 @@ impl<T> RingBuffer<T> {
 
     // private full reducing atomic operations to compared indices
     fn full(&self, r: usize, w: usize) -> bool {
-        w.abs_diff(r) >= self.capacity
+        w.abs_diff(r) >= *self.capacity
     }
 
     // private empty reducing atomic operations to compared indices
@@ -73,7 +74,7 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
             let widx = self.write_idx.load(Ordering::Acquire);
-            let i = idx % self.capacity;
+            let i = idx % *self.capacity;
             if self.empty(idx, widx) {
                 return Err(());
             }
@@ -120,7 +121,7 @@ impl<T> RingBuffer<T> {
             };
             self.buffer[i]
                 .stamp
-                .store(idx.wrapping_add(self.capacity + 1), Ordering::Release);
+                .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
             break;
         }
         Ok(rr)
@@ -130,7 +131,7 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
             let ridx = self.read_idx.load(Ordering::Acquire);
-            let i = idx % self.capacity;
+            let i = idx % *self.capacity;
             if self.full(ridx, idx) {
                 return Err(());
             }
