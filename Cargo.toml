@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "limitless"
 path = "src/main.rs"
 
+[[bench]]
+name = "benchmarks"
+harness = false
+
 [dependencies]
 cfg-if = "1.0.4"
 
@@ -20,3 +24,6 @@ loom = "0.7"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dev-dependencies]
+criterion = "0.8.2"
