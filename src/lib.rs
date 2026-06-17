@@ -114,17 +114,23 @@ impl<T> RingBuffer<T> {
             // - does not re-enter on a full loop; uninitialization is specific and can't read uninitialized data
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    rr = unsafe {self.buffer.get_unchecked(i).data.with(|ptr| core::ptr::read(ptr).assume_init())};
+                    unsafe {
+                        rr = self.buffer.get_unchecked(i).data.with(|ptr| core::ptr::read(ptr).assume_init());
+                        self.buffer.get_unchecked(i)
+                            .stamp
+                            .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
+                    }
                 } else {
-                    rr = unsafe { self.buffer.get_unchecked(i).data.get().read().assume_init() };
+                    unsafe {
+                        rr = self.buffer.get_unchecked(i).data.get().read().assume_init();
+                        self.buffer.get_unchecked(i)
+                            .stamp
+                            .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
+                    }
                 }
             };
-            self.buffer[i]
-                .stamp
-                .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
-            break;
+            return Ok(rr);
         }
-        Ok(rr)
     }
 
     pub fn write(&self, v: T) -> Result<(), ()> {
@@ -172,15 +178,19 @@ impl<T> RingBuffer<T> {
             // - does not re-enter on a full loop; initialization is not ambiguous, no overwrite
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
-                    unsafe { self.buffer.get_unchecked(i).data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v))) }
+                    unsafe {
+                        self.buffer.get_unchecked(i).data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v)));
+                        self.buffer.get_unchecked(i).stamp.store(idx, Ordering::Release);
+                    }
                 } else {
-                    unsafe { self.buffer.get_unchecked(i).data.get().write(MaybeUninit::new(v)) }
+                    unsafe {
+                        self.buffer.get_unchecked(i).data.get().write(MaybeUninit::new(v));
+                        self.buffer.get_unchecked(i).stamp.store(idx, Ordering::Release);
+                    }
                 }
             };
-            self.buffer[i].stamp.store(idx, Ordering::Release);
-            break;
+            return Ok(());
         }
-        Ok(())
     }
 }
 
