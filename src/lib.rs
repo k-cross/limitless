@@ -27,6 +27,7 @@ pub struct RingBuffer<T> {
     capacity: CachePadded<usize>,
     read_idx: CachePadded<AtomicUsize>,
     write_idx: CachePadded<AtomicUsize>,
+    mcb: CachePadded<usize>,
 }
 
 unsafe impl<T> Send for RingBuffer<T> {}
@@ -43,6 +44,7 @@ impl<T> RingBuffer<T> {
         Self {
             buffer,
             capacity: CachePadded::new(capacity),
+            mcb: CachePadded::new((capacity + 1).next_power_of_two()),
             read_idx: CachePadded::new(AtomicUsize::new(0)),
             write_idx: CachePadded::new(AtomicUsize::new(0)),
         }
@@ -61,7 +63,8 @@ impl<T> RingBuffer<T> {
 
     // private full reducing atomic operations to compared indices
     fn full(&self, r: usize, w: usize) -> bool {
-        w.abs_diff(r) >= *self.capacity
+        let cbits = *self.mcb - 1;
+        (w & cbits) == (r & cbits) && r != w
     }
 
     // private empty reducing atomic operations to compared indices
@@ -73,12 +76,18 @@ impl<T> RingBuffer<T> {
         let rr: T;
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
-            let widx = self.write_idx.load(Ordering::Acquire);
-            let i = idx % *self.capacity;
-            if self.empty(idx, widx) {
-                return Err(());
-            }
+            let i = idx & (*self.mcb - 1);
+            let new_idx = if i + 1 >= *self.capacity {
+                // zero bits but flip flag
+                0 | (idx & *self.mcb) ^ *self.mcb
+            } else {
+                idx + 1
+            };
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
+                let widx = self.write_idx.load(Ordering::Acquire);
+                if self.empty(idx, widx) {
+                    return Err(());
+                }
                 // spin until initialized
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
@@ -91,12 +100,7 @@ impl<T> RingBuffer<T> {
             }
             if self
                 .read_idx
-                .compare_exchange_weak(
-                    idx,
-                    idx.wrapping_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(idx, new_idx, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 cfg_if::cfg_if! {
@@ -118,14 +122,14 @@ impl<T> RingBuffer<T> {
                         rr = self.buffer.get_unchecked(i).data.with(|ptr| core::ptr::read(ptr).assume_init());
                         self.buffer.get_unchecked(i)
                             .stamp
-                            .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
+                            .store((idx + 1) ^ *self.mcb, Ordering::Release);
                     }
                 } else {
                     unsafe {
                         rr = self.buffer.get_unchecked(i).data.get().read().assume_init();
                         self.buffer.get_unchecked(i)
                             .stamp
-                            .store(idx.wrapping_add(*self.capacity + 1), Ordering::Release);
+                            .store((idx + 1) ^ *self.mcb, Ordering::Release);
                     }
                 }
             };
@@ -136,12 +140,18 @@ impl<T> RingBuffer<T> {
     pub fn write(&self, v: T) -> Result<(), ()> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
-            let ridx = self.read_idx.load(Ordering::Acquire);
-            let i = idx % *self.capacity;
-            if self.full(ridx, idx) {
-                return Err(());
-            }
-            if self.buffer[i].stamp.load(Ordering::Acquire) != idx.wrapping_add(1) {
+            let i = idx & (*self.mcb - 1);
+            let new_idx = if i + 1 >= *self.capacity {
+                // zero bits but flip flag
+                0 | (idx & *self.mcb) ^ *self.mcb
+            } else {
+                idx + 1
+            };
+            if self.buffer[i].stamp.load(Ordering::Acquire) != idx + 1 {
+                let ridx = self.read_idx.load(Ordering::Acquire);
+                if self.full(ridx, idx) {
+                    return Err(());
+                }
                 // spin until uninitialized
                 cfg_if::cfg_if! {
                     if #[cfg(loom)] {
@@ -154,12 +164,7 @@ impl<T> RingBuffer<T> {
             }
             if self
                 .write_idx
-                .compare_exchange_weak(
-                    idx,
-                    idx.wrapping_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(idx, new_idx, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 // Note: maybe need to add jitter/backoff here
@@ -179,7 +184,10 @@ impl<T> RingBuffer<T> {
             cfg_if::cfg_if! {
                 if #[cfg(loom)] {
                     unsafe {
-                        self.buffer.get_unchecked(i).data.with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v)));
+                        self.buffer
+                            .get_unchecked(i)
+                            .data
+                            .with_mut(|ptr| core::ptr::write(ptr, MaybeUninit::new(v)));
                         self.buffer.get_unchecked(i).stamp.store(idx, Ordering::Release);
                     }
                 } else {
