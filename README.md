@@ -7,6 +7,11 @@ A project that implements high-performance thread safe data structures.
 Given my machines are usually MacOS I did performance analysis using it unless otherwise stated.
 
 Under a high contention scenario with 4 read and 4 write threads, the following was observed:
-- L1 Cache Miss Rate: 31%
-- Instructions per Clock: 0.45
+- L1 Cache Miss Rate: 17%
+- Instructions per Clock: 0.08
+- Atomic Miss Rate: 53%
 - Full CPU utilization: N - 1 logical cores
+
+Under the same benchmark, it performs twice as fast as the `ArrayQueue`
+provided by _crossbeam_, but this is not really intended to be a replacement
+for it either.
