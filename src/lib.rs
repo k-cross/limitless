@@ -1,5 +1,7 @@
 use core::mem::MaybeUninit;
 use crossbeam::utils::CachePadded;
+use std::error::Error;
+use std::fmt;
 #[cfg(not(loom))]
 use {
     core::cell::UnsafeCell,
@@ -12,6 +14,23 @@ use {
     loom::lazy_static::yield_now,
     loom::sync::atomic::{AtomicUsize, Ordering},
 };
+
+#[derive(Debug, PartialEq)]
+pub enum RingBufferError {
+    Full,
+    Empty,
+}
+
+impl fmt::Display for RingBufferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RingBufferError::Empty => write!(f, "There are no items"),
+            RingBufferError::Full => write!(f, "The buffer is full"),
+        }
+    }
+}
+
+impl Error for RingBufferError {}
 
 #[derive(Debug)]
 struct Slot<T> {
@@ -72,21 +91,21 @@ impl<T> RingBuffer<T> {
         w == r
     }
 
-    pub fn read(&self) -> Result<T, ()> {
+    pub fn read(&self) -> Result<T, RingBufferError> {
         let rr: T;
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
             let i = idx & (*self.mcb - 1);
             let new_idx = if i + 1 >= *self.capacity {
                 // zero bits but flip flag
-                0 | (idx & *self.mcb) ^ *self.mcb
+                (idx & *self.mcb) ^ *self.mcb
             } else {
                 idx + 1
             };
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
                 let widx = self.write_idx.load(Ordering::Acquire);
                 if self.empty(idx, widx) {
-                    return Err(());
+                    return Err(RingBufferError::Empty);
                 }
                 // spin until initialized
                 cfg_if::cfg_if! {
@@ -137,20 +156,20 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    pub fn write(&self, v: T) -> Result<(), ()> {
+    pub fn write(&self, v: T) -> Result<(), RingBufferError> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
             let i = idx & (*self.mcb - 1);
             let new_idx = if i + 1 >= *self.capacity {
                 // zero bits but flip flag
-                0 | (idx & *self.mcb) ^ *self.mcb
+                (idx & *self.mcb) ^ *self.mcb
             } else {
                 idx + 1
             };
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx + 1 {
                 let ridx = self.read_idx.load(Ordering::Acquire);
                 if self.full(ridx, idx) {
-                    return Err(());
+                    return Err(RingBufferError::Full);
                 }
                 // spin until uninitialized
                 cfg_if::cfg_if! {
@@ -242,12 +261,12 @@ mod tests {
                 assert_eq!(Ok(()), rb.write(i));
             }
             // full
-            assert_eq!(Err(()), rb.write(6));
+            assert_eq!(Err(RingBufferError::Full), rb.write(6));
             for i in 0..(SIZE) {
                 assert_eq!(Ok(i), rb.read());
             }
             // empty
-            assert_eq!(Err(()), rb.read());
+            assert_eq!(Err(RingBufferError::Empty), rb.read());
         }
     }
 
