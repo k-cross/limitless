@@ -70,10 +70,10 @@ impl<T> RingBuffer<T> {
     }
 
     pub fn is_full(&self) -> bool {
-        self.write_idx
-            .load(Ordering::Acquire)
-            .abs_diff(self.read_idx.load(Ordering::Acquire))
-            >= *self.capacity
+        let w = self.write_idx.load(Ordering::Acquire);
+        let r = self.read_idx.load(Ordering::Acquire);
+        let mask = *self.mcb - 1;
+        (w & mask) == (r & mask) && r != w
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,8 +82,8 @@ impl<T> RingBuffer<T> {
 
     // private full reducing atomic operations to compared indices
     fn full(&self, r: usize, w: usize) -> bool {
-        let cbits = *self.mcb - 1;
-        (w & cbits) == (r & cbits) && r != w
+        let mask = *self.mcb - 1;
+        (w & mask) == (r & mask) && r != w
     }
 
     // private empty reducing atomic operations to compared indices
@@ -96,12 +96,10 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
             let i = idx & (*self.mcb - 1);
-            let new_idx = if i + 1 >= *self.capacity {
-                // zero bits but flip flag
-                (idx & *self.mcb) ^ *self.mcb
-            } else {
-                idx + 1
-            };
+            // save true or false to 0 or 1 in branchless computation
+            let at_capacity = (i + 1 >= *self.capacity) as usize;
+            let new_idx = ((idx + 1) & at_capacity.wrapping_sub(1))
+                | (at_capacity * ((idx & *self.mcb) ^ *self.mcb));
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
                 let widx = self.write_idx.load(Ordering::Acquire);
                 if self.empty(idx, widx) {
@@ -160,12 +158,9 @@ impl<T> RingBuffer<T> {
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
             let i = idx & (*self.mcb - 1);
-            let new_idx = if i + 1 >= *self.capacity {
-                // zero bits but flip flag
-                (idx & *self.mcb) ^ *self.mcb
-            } else {
-                idx + 1
-            };
+            let at_capacity = (i + 1 >= *self.capacity) as usize;
+            let new_idx = ((idx + 1) & at_capacity.wrapping_sub(1))
+                | (at_capacity * ((idx & *self.mcb) ^ *self.mcb));
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx + 1 {
                 let ridx = self.read_idx.load(Ordering::Acquire);
                 if self.full(ridx, idx) {
@@ -255,9 +250,14 @@ mod tests {
         const SIZE: usize = 5;
         let rb: RingBuffer<usize> = RingBuffer::new(SIZE);
 
+        // empty
+        assert_eq!(Err(RingBufferError::Empty), rb.read());
+
         // cycle twice to catch syncronization issues between empty/full state changes
-        for _ in 0..2 {
+        for cnt in 0..2 {
+            println!("iteration {cnt}");
             for i in 0..(SIZE) {
+                println!("write {i}");
                 assert_eq!(Ok(()), rb.write(i));
             }
             // full
