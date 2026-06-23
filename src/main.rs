@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 fn main() {
+    limitless::register_probes().expect("failed to register USDT probes");
     const SIZE: usize = 1024 * 16;
     let logical_cores: usize = thread::available_parallelism().unwrap().into();
     // needs to be EVEN for test assumptions to work

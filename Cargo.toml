@@ -19,6 +19,7 @@ harness = false
 [dependencies]
 cfg-if = "1.0"
 crossbeam = "0.8"
+usdt = "0.6.0"
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"

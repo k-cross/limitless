@@ -1,3 +1,5 @@
+pub use usdt::register_probes;
+
 use core::mem::MaybeUninit;
 use crossbeam::utils::CachePadded;
 use std::error::Error;
@@ -14,6 +16,14 @@ use {
     loom::lazy_static::yield_now,
     loom::sync::atomic::{AtomicUsize, Ordering},
 };
+
+#[usdt::provider]
+mod limitless_probes {
+    fn read__start(_: &usdt::UniqueId) {}
+    fn read__done(_: &usdt::UniqueId, idx: u64, ok: u8) {}
+    fn write__start(_: &usdt::UniqueId) {}
+    fn write__done(_: &usdt::UniqueId, idx: u64, ok: u8) {}
+}
 
 #[derive(Debug, PartialEq)]
 pub enum RingBufferError {
@@ -92,6 +102,8 @@ impl<T> RingBuffer<T> {
     }
 
     pub fn read(&self) -> Result<T, RingBufferError> {
+        let probe_id = usdt::UniqueId::new();
+        limitless_probes::read__start!(|| &probe_id);
         let rr: T;
         loop {
             let idx = self.read_idx.load(Ordering::Acquire);
@@ -103,6 +115,7 @@ impl<T> RingBuffer<T> {
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx {
                 let widx = self.write_idx.load(Ordering::Acquire);
                 if self.empty(idx, widx) {
+                    limitless_probes::read__done!(|| (&probe_id, i as u64, 0u8));
                     return Err(RingBufferError::Empty);
                 }
                 // spin until initialized
@@ -150,11 +163,14 @@ impl<T> RingBuffer<T> {
                     }
                 }
             };
+            limitless_probes::read__done!(|| (&probe_id, i as u64, 1u8));
             return Ok(rr);
         }
     }
 
     pub fn write(&self, v: T) -> Result<(), RingBufferError> {
+        let probe_id = usdt::UniqueId::new();
+        limitless_probes::write__start!(|| &probe_id);
         loop {
             let idx = self.write_idx.load(Ordering::Acquire);
             let i = idx & (*self.mcb - 1);
@@ -164,6 +180,7 @@ impl<T> RingBuffer<T> {
             if self.buffer[i].stamp.load(Ordering::Acquire) != idx + 1 {
                 let ridx = self.read_idx.load(Ordering::Acquire);
                 if self.full(ridx, idx) {
+                    limitless_probes::write__done!(|| (&probe_id, i as u64, 0u8));
                     return Err(RingBufferError::Full);
                 }
                 // spin until uninitialized
@@ -211,6 +228,7 @@ impl<T> RingBuffer<T> {
                     }
                 }
             };
+            limitless_probes::write__done!(|| (&probe_id, i as u64, 1u8));
             return Ok(());
         }
     }
