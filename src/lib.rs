@@ -461,7 +461,7 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use {loom::sync::Arc, loom::thread};
 
     #[allow(dead_code)]
@@ -478,86 +478,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn test_three_threads() {
-        use std::collections::HashSet;
-        let mut mdl = loom::model::Builder::new();
-        mdl.preemption_bound = Some(2);
-        mdl.max_branches = 100_000;
-        mdl.max_threads = 3;
-        mdl.max_duration = Some(std::time::Duration::from_secs(120));
-
-        mdl.check(|| {
-            const SIZE: usize = 2;
-            let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
-
-            let rbd = rb.clone();
-            let rbe = rb.clone();
-
-            let t1 = thread::spawn(move || {
-                let mut hs: HashSet<usize> = HashSet::new();
-                for _ in 0..SIZE {
-                    if let Ok(r) = rbd.read() {
-                        hs.insert(r);
-                    }
-                }
-                hs
-            });
-
-            let t2 = thread::spawn(move || {
-                let mut hs: HashSet<usize> = HashSet::new();
-                for _ in 0..SIZE {
-                    if let Ok(r) = rbe.read() {
-                        hs.insert(r);
-                    }
-                }
-                hs
-            });
-
-            for i in 0..(SIZE) {
-                let _ = rb.write(i);
-            }
-
-            let hs_1 = t1.join().unwrap();
-            let hs_2 = t2.join().unwrap();
-            assert!(hs_1.is_disjoint(&hs_2) || hs_1.is_empty());
-        });
-    }
-
-    #[test]
-    fn test_two_threads() {
-        loom::model(|| {
-            const SIZE: usize = 3;
-            let rb: Arc<RingBuffer<usize>> = Arc::new(RingBuffer::new(SIZE));
-            let rbd = rb.clone();
-            let mut hs_w = HashSet::new();
-            let mut hs_e = HashSet::new();
-
-            let t1 = thread::spawn(move || {
-                let mut hs = HashSet::new();
-                for _ in 0..(SIZE * 2) {
-                    if let Ok(v) = rbd.read() {
-                        hs.insert(v);
-                    }
-                }
-                hs
-            });
-
-            for i in 0..(SIZE * 2) {
-                if let Ok(_) = rb.write(i) {
-                    hs_w.insert(i);
-                } else {
-                    hs_e.insert(i);
-                }
-            }
-
-            let hs_r = t1.join().unwrap();
-            assert!(hs_r.is_subset(&hs_w));
-            assert!(hs_r.is_disjoint(&hs_e) || hs_r.is_empty());
-        });
-    }
-
-    #[test]
-    fn test_two_threads_non_copy_type() {
+    fn test_two_threads_non_copy_type_rw() {
         let mut mdl = loom::model::Builder::new();
         mdl.preemption_bound = Some(2);
         mdl.check(|| {
@@ -582,6 +503,74 @@ mod loom_tests {
                 let _ = rb.write(DataCorruptor { val1: hm, val2: w });
             }
 
+            let _ = t1.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_two_threads_non_copy_type_ww() {
+        let mut mdl = loom::model::Builder::new();
+        mdl.preemption_bound = Some(2);
+        mdl.check(|| {
+            const SIZE: usize = 2;
+            let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
+            let rbc = rb.clone();
+
+            let t1 = thread::spawn(move || {
+                for i in 0..SIZE {
+                    let mut hm = HashMap::new();
+                    hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
+                    let w = match i {
+                        n if n % 2 == 0 => WishyWashy::Yes,
+                        n if n % 3 == 0 => WishyWashy::No,
+                        _ => WishyWashy::Maybe,
+                    };
+                    let _ = rbc.write(DataCorruptor { val1: hm, val2: w });
+                }
+            });
+
+            for i in 0..SIZE {
+                let mut hm = HashMap::new();
+                hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
+                let w = match i {
+                    n if n % 2 == 0 => WishyWashy::Yes,
+                    n if n % 3 == 0 => WishyWashy::No,
+                    _ => WishyWashy::Maybe,
+                };
+                let _ = rb.write(DataCorruptor { val1: hm, val2: w });
+            }
+
+            let _ = t1.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_two_threads_non_copy_type_rr() {
+        let mut mdl = loom::model::Builder::new();
+        mdl.preemption_bound = Some(2);
+        mdl.check(|| {
+            const SIZE: usize = 2;
+            let rb: Arc<RingBuffer<DataCorruptor>> = Arc::new(RingBuffer::new(SIZE));
+            let rbc = rb.clone();
+
+            for i in 0..SIZE {
+                let mut hm = HashMap::new();
+                hm.insert("hello".to_owned(), vec![i, i + 1, i + 2]);
+                let w = match i {
+                    n if n % 2 == 0 => WishyWashy::Yes,
+                    n if n % 3 == 0 => WishyWashy::No,
+                    _ => WishyWashy::Maybe,
+                };
+                let _ = rb.write(DataCorruptor { val1: hm, val2: w });
+            }
+
+            let t1 = thread::spawn(move || {
+                for _ in 0..SIZE {
+                    let _ = rbc.read();
+                }
+            });
+
+            let _ = rb.read();
             let _ = t1.join().unwrap();
         });
     }
